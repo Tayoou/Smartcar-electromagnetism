@@ -1,0 +1,7 @@
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/arch=x86_64
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/name=Local
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/os=win32
+configDescList=org.eclipse.launchbar.core.descriptorType.default\:LQ_TC26DA_dianci L 20201208,org.eclipse.launchbar.core.descriptorType.default\:LQ_TC26xB_LIB_ADS,org.eclipse.launchbar.core.descriptorType.default\:My_test_official
+eclipse.preferences.version=1
+org.eclipse.launchbar.core.descriptorType.default\:LQ_TC26DA_dianci\ L\ 20201208/activeLaunchMode=debug
+org.eclipse.launchbar.core.descriptorType.default\:LQ_TC26DA_dianci\ L\ 20201208/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local

@@ -1,0 +1,600 @@
+/*
+ * FJC_NewCS.c
+ *
+ *  Created on: 2021年4月29日
+ *      Author: 96556
+ */
+
+#include "FJC_NewCS.h"
+#include <LQ_STM.h>
+#include <LQ_CCU6.h>
+
+/****************模糊pid控制板块**************************************/
+#define PMAX 100
+#define PMIN -100
+#define DMAX 100
+#define DMIN -100
+#define FMAX 100       //语言值的满幅值
+
+extern float ad_VAL[6];           //滤波归一化后ad数据
+extern float AD_VAL[6];
+extern unsigned char dao_flag;
+unsigned char res = 0;
+
+
+unsigned int fjc_duty = Servo_Center_Mid;
+unsigned char hd_dir = 0;
+unsigned char hd_in = 0;
+unsigned int speed = 2500;
+extern unsigned char hd_flag;
+
+
+
+int PFF[4] = {0,7,12,16};    //PFF[3]为电感最大值，其余值等值增加即可
+int DFF[4] = {0,5,9,13};      //DFF[3]为电感变化量的最大值，其余值等值增加即可
+int UFF[7] = {0,160,290,420,550,680,710};     //舵机打角过程占空比
+float curr_val = 0.0;                       //电磁偏差，差和比运算的结果
+float delta_val = 0.0;                      //电磁值偏差变化率
+float last_val = 0.0;                       //上一次的电磁值
+float up_curr_val = 0.0;                    //竖直电感偏差
+float up_last_val = 0.0;               //竖直电感上一次的值
+float up_delta_val = 0.0;                   //竖直电感电磁变化率
+float elect_M ;                             //中间两个电感的平均值
+int fuzzy_txt[10];                          //串口传送调用规则表坐标
+float fuzzy_txt1[3] = {0};                         //屏幕输出U、差比和差结果的大小
+int fuzzy_txt2[1] = {0};
+int rule[7][7]={//误差变化率 -3,-2,-1, 0, 1, 2, 3                                                                                                                        使用sendFuzzyData()函数校准模糊pid规则表。在临界丢线处进行规则表调整
+                {-6,-6,-6,-5,-5,-5,-4,},                      //   -3      0
+                {-6,-5,-5,-3,-1,-2,-1,},                      //   -2      1
+                {-6,-4,-2,-1, 0, 1, 2,},                      //   -1      2
+                {-4,-4, 2, 0, 1, 4, 5,},                      //    0      3
+                {-2,-1, 0, 0, 2, 6, 5,},                      //    1      4
+                { 1, 3, 4, 2, 5, 6, 6,},                      //    2      5
+                { 4, 5, 5, 6, 6, 6, 6} };                     //    3      6
+
+/******************丢线相关变量***********************/
+int lose_line = 0;                        //丢线判断值，此值为1为丢线
+int lose_lineres = 70;                    //丢线边界值，此值需要测量
+
+/******************环岛相关变量***********************/
+unsigned int Circle_Flag = 0;             //环岛标志位
+unsigned int LeftCircle_Flag = 0;         //左环
+unsigned int RightCircle_Flag = 0;        //右环
+
+/*************************************************************************
+*  函数名称：float my_sqrt(float number)
+*  功能说明：牛顿迭代法计算平方根
+*  参数说明：float number：原始数值输入
+*  函数返回：返回平方根
+*  修改时间：2021年4月28日
+*  备    注：0x5f3759df的来历比较复杂，详见维基百科
+*************************************************************************/
+float my_sqrt(float number)
+{
+    long i;
+    float x, y;
+    const float f = 1.5F;
+    x = number * 0.5F;
+    y = number;
+    i = * ( long * ) &y;
+    i = 0x5f3759df - ( i >> 1 );
+
+    y = * ( float * ) &i;
+    y = y * ( f - ( x * y * y ) );
+    y = y * ( f - ( x * y * y ) );
+    return number * y;
+}
+
+/*************************************************************************
+*  函数名称：float my_absolute(float number)
+*  功能说明：求绝对值
+*  参数说明：float number：原始数值输入
+*  函数返回：返回平方根
+*  修改时间：2021年4月29日
+*  备    注：对输入值做绝对值处理
+*************************************************************************/
+float my_absolute(float number)
+{
+    if(number < 0)
+    {
+        number = -number;
+    }
+    return number;
+}
+
+/*************************************************************************
+*  函数名称：void aricomsumope()
+*  功能说明：差比和差运算(由于四个系数难以确定,因此弃用差比和差算法）
+*  参数说明：acso_abcp的值需要后期调整得到
+*  函数返回：无
+*  修改时间：2021年4月29日
+*  备    注：差比和差算法，差比和差算法相较差比和算法拥有更加优秀的鲁棒性
+*************************************************************************/
+void aricomsumope()
+{
+    const float acso_a = 0.4;
+    const float acso_b = 0.6;
+    const float acso_c = 0.6;
+    const float acso_p = 1;      //比例系数p
+    last_val = curr_val;
+    curr_val =  acso_p*((acso_a*(ad_VAL[4] - ad_VAL[1])+acso_b*(ad_VAL[5] - ad_VAL[0]))/(acso_a*(ad_VAL[4] + ad_VAL[1])+acso_c*(my_absolute(ad_VAL[5]-ad_VAL[0]))));
+    delta_val = curr_val - last_val;
+    fuzzy_txt1[0] = curr_val;
+}
+
+/*************************************************************************
+*  函数名称：float Vag_pid(float currval,float deltaval)
+*  功能说明：舵机模糊pid控制
+*  参数说明：currval:电磁偏差，差比和差运算的结果；deltaval：电磁值偏差变化率;U:占空比变化量
+*  函数返回：float类型的占空比
+*  修改时间：2021年5月5日
+*  备    注：利用模糊pid对舵机打角进行实时参数调整
+*************************************************************************/
+float Vag_pid(float currval,float deltaval)
+{
+    float U;                //偏差,偏差微分以及输出值的精确量
+    float PF[2], DF[2], UF[4];//偏差,偏差微分以及输出值的隶属度
+    int Pn, Dn, Un[4];        //Un对应表中四个调用元素
+    float temp1, temp2;
+    if(currval < 0)
+        currval  *= 1.2;
+
+
+    fuzzy_txt1[0] = currval;
+    fuzzy_txt1[1] = deltaval;
+    /*隶属度的确定*/
+    /*根据PD的指定语言值获得有效隶属度*/
+    if (currval > -PFF[3] && currval < PFF[3])
+    {
+        if (currval <= -PFF[2])
+        {
+            Pn = -2;
+            PF[0] = FMAX * ((float)(-PFF[2] - currval) / (PFF[3] - PFF[2]));
+        }
+        else if (currval <= -PFF[1])
+        {
+            Pn = -1;
+            PF[0] = FMAX * ((float)(-PFF[1] - currval) / (PFF[2] - PFF[1]));
+        }
+        else if (currval <= PFF[0])
+        {
+            Pn = 0;
+            PF[0] = FMAX * ((float)(-PFF[0] - currval) / (PFF[1] - PFF[0]));
+        }
+        else if (currval <= PFF[1])
+        {
+            Pn = 1; PF[0] = FMAX * ((float)(PFF[1] - currval) / (PFF[1] - PFF[0]));
+        }
+        else if (currval <= PFF[2])
+        {
+            Pn = 2; PF[0] = FMAX * ((float)(PFF[2] - currval) / (PFF[2] - PFF[1]));
+        }
+        else if (currval <= PFF[3])
+        {
+            Pn = 3; PF[0] = FMAX * ((float)(PFF[3] - currval) / (PFF[3] - PFF[2]));
+        }
+    }
+    else if (currval <= -PFF[3])
+    {
+        Pn = -2; PF[0] = FMAX;
+    }
+    else if (currval >= PFF[3])
+    {
+        Pn = 3; PF[0] = 0;
+    }
+    PF[1] = FMAX - PF[0];
+
+    if (deltaval > -DFF[3] && deltaval < DFF[3])
+    {
+        if (deltaval <= -DFF[2])
+        {
+            Dn = -2; DF[0] = FMAX * ((float)(-DFF[2] - deltaval) / (DFF[3] - DFF[2]));
+        }
+        else if (deltaval <= -DFF[1])
+        {
+            Dn = -1;
+            DF[0] = FMAX * ((float)(-DFF[1] - deltaval) / (DFF[2] - DFF[1]));
+        }
+        else if (deltaval <= DFF[0])
+        {
+            Dn = 0;
+            DF[0] = FMAX * ((float)(-DFF[0] - deltaval) / (DFF[1] - DFF[0]));
+        }
+        else if (deltaval <= DFF[1])
+        {
+            Dn = 1;
+            DF[0] = FMAX * ((float)(DFF[1] - deltaval) / (DFF[1] - DFF[0]));
+        }
+        else if (deltaval <= DFF[2])
+        {
+            Dn = 2; DF[0] = FMAX * ((float)(DFF[2] - deltaval) / (DFF[2] - DFF[1]));
+        }
+        else if (deltaval <= DFF[3])
+        {
+            Dn = 3; DF[0] = FMAX * ((float)(DFF[3] - deltaval) / (DFF[3] - DFF[2]));
+        }
+    }
+    else if (deltaval <= -DFF[3])
+    {
+        Dn = -2;
+        DF[0] = FMAX;
+    }
+    else if (deltaval >= DFF[3])
+    {
+        Dn = 3;
+        DF[0] = 0;
+    }
+    DF[1] = FMAX - DF[0];
+
+    /*使用误差范围优化后的规则表rule[7][7]*/
+    /*输出值使用13个隶属函数,中心值由UFF[7]指定*/
+    /*一般都是四个规则有效*/
+    fuzzy_txt[0]=Pn - 1 + 3;
+    fuzzy_txt[1]=Dn - 1 + 3;
+    fuzzy_txt[2]=Pn + 3;
+    fuzzy_txt[3]=Dn - 1 + 3;
+    fuzzy_txt[4]=Pn - 1 + 3;
+    fuzzy_txt[5]=Dn + 3;
+    fuzzy_txt[6]=Pn + 3;
+    fuzzy_txt[7]=Dn + 3;
+
+    Un[0] = rule[Pn - 1 + 3][Dn - 1 + 3];
+    Un[1] = rule[Pn + 3][Dn - 1 + 3];
+    Un[2] = rule[Pn - 1 + 3][Dn + 3];
+    Un[3] = rule[Pn + 3][Dn + 3];
+    if (PF[0] <= DF[0]) UF[0] = PF[0];
+    else    UF[0] = DF[0];
+    if (PF[1] <= DF[0]) UF[1] = PF[1];
+    else    UF[1] = DF[0];
+    if (PF[0] <= DF[1]) UF[2] = PF[0];
+    else    UF[2] = DF[1];
+    if (PF[1] <= DF[1]) UF[3] = PF[1];
+    else    UF[3] = DF[1];
+
+    /*同隶属函数输出语言值求大*/
+    if (Un[0] == Un[1])
+    {
+        if (UF[0] > UF[1])  UF[1] = 0;
+        else    UF[0] = 0;
+    }
+    if (Un[0] == Un[2])
+    {
+        if (UF[0] > UF[2])  UF[2] = 0;
+        else    UF[0] = 0;
+    }
+    if (Un[0] == Un[3])
+    {
+        if (UF[0] > UF[3])  UF[3] = 0;
+        else    UF[0] = 0;
+    }
+    if (Un[1] == Un[2])
+    {
+        if (UF[1] > UF[2])  UF[2] = 0;
+        else    UF[1] = 0;
+    }
+    if (Un[1] == Un[3])
+    {
+        if (UF[1] > UF[3])  UF[3] = 0;
+        else    UF[1] = 0;
+    }
+    if (Un[2] == Un[3])
+    {
+        if (UF[2] > UF[3])  UF[3] = 0;
+        else    UF[2] = 0;
+    }
+//
+    /*重心法反模糊*/
+    /*Un[]原值为输出隶属函数标号，转换为隶属函数值*/
+    if (Un[0] >= 0) Un[0] = UFF[Un[0]];
+    else            Un[0] = -UFF[-Un[0]];
+    if (Un[1] >= 0) Un[1] = UFF[Un[1]];
+    else            Un[1] = -UFF[-Un[1]];
+    if (Un[2] >= 0) Un[2] = UFF[Un[2]];
+    else            Un[2] = -UFF[-Un[2]];
+    if (Un[3] >= 0) Un[3] = UFF[Un[3]];
+    else            Un[3] = -UFF[-Un[3]];
+
+    temp1 = UF[0] * Un[0] + UF[1] * Un[1] + UF[2] * Un[2] + UF[3] * Un[3];
+    temp2 = UF[0] + UF[1] + UF[2] + UF[3];
+    U = temp1 / temp2;
+
+//    sendFuzzyData();
+    return U;
+}
+
+/*************************************************************************
+*  函数名称：void sendFuzzyData()
+*  功能说明：校准规则表中的数值
+*  参数说明：无
+*  函数返回：无
+*  修改时间：2021年5月5日
+*  备    注：无
+*************************************************************************/
+void sendFuzzyData(){
+  char txt[10];
+
+   UART_PutStr(UART0, "-");
+
+  for(int i = 0;i<8;i++){
+    sprintf(txt,"%d",fuzzy_txt[i]);
+    if(i==0 || i == 2 || i == 4 || i == 6){
+        UART_PutStr (UART0, "[");
+        UART_PutStr (UART0, txt);
+        UART_PutStr (UART0, ".");
+    }
+    else{
+        UART_PutStr (UART0, txt);
+        UART_PutStr (UART0, "]");
+    }
+
+  }
+  UART_PutStr (UART0, "\r\n");
+}
+
+/*************************************************************************
+*  函数名称：void LoseJudge()
+*  功能说明：丢线判断函数
+*  参数说明：无
+*  函数返回：无
+*  修改时间：2021年5月6日
+*  备    注：无
+*************************************************************************/
+void LoseJudge()
+{
+    if (!lose_line) {
+        if(ad_VAL[1] <= lose_lineres || ad_VAL[4] <= lose_lineres){
+                lose_line = 1;
+        }
+    }
+}
+
+/*************************************************************************
+*  函数名称：void DJCrol()
+*  功能说明：舵机控制函数
+*  参数说明：无
+*  函数返回：无
+*  修改时间：2021年5月9日
+*  备    注：无
+*************************************************************************/
+void DJCrol()
+{
+    char txtq[15] = {0};
+   // char txta[15] = {0};
+    char txtb[15] = {0};
+    char txtd[15] = {0};
+    char txta[15] = {0};
+
+    My_ReadADC();  // 采集电感值
+    Get_ADC();
+    Datadeal();
+    fjc_duty = Servo_Center_Mid + Vag_pid(curr_val*45,delta_val*100);
+    fjc_duty = constrain_int(fjc_duty,570,1840);  // 限幅
+    fuzzy_txt1[2] = fjc_duty;
+    DirJudge();
+    fuzzy_txt2[0] = res;
+    /* 舵机电机赋值 */
+    if(res == 1)    //左转
+    {
+        ATOM_PWM_SetDuty(ATOMSERVO2, 570 , 100);
+        ATOM_PWM_SetDuty(ATOMPWM0,1800, 12500);    //设定舵机的占空比
+        if(dao_flag == 1)
+        {
+            ATOM_PWM_SetDuty(ATOMSERVO2, 1840 , 100);
+//            delayms(50);
+            ATOM_PWM_SetDuty(ATOMPWM1,1700, 12500);    //设定舵机的占空比
+            ATOM_PWM_SetDuty(ATOMPWM0,0, 12500);    //设定舵机的占空比
+        }
+    }
+    else if(res == 2)
+    {
+        ATOM_PWM_SetDuty(ATOMSERVO2, 1840, 100);
+        ATOM_PWM_SetDuty(ATOMPWM0,1800, 12500);    //设定舵机的占空比
+        if(dao_flag == 2)
+        {
+             ATOM_PWM_SetDuty(ATOMSERVO2, 570 , 100);
+//             delayms(50);
+             ATOM_PWM_SetDuty(ATOMPWM1,1700, 12500);    //设定舵机的占空比
+             ATOM_PWM_SetDuty(ATOMPWM0,0, 12500);    //设定舵机的占空比
+        }
+    }
+    else if(res == 3)
+    {
+        if(AD_VAL[2] > 500)
+        {
+           ATOM_PWM_SetDuty(ATOMSERVO2, 1800 , 100);
+           ATOM_PWM_SetDuty(ATOMPWM0,3000, 12500);    //设定舵机的占空比
+        }
+        else
+        {
+            ATOM_PWM_SetDuty(ATOMSERVO2, 1800 , 100);
+            ATOM_PWM_SetDuty(ATOMPWM0,3000, 12500);    //设定舵机的占空比
+        }
+    }
+    else if(res == 4)
+    {
+        ATOM_PWM_SetDuty(ATOMSERVO2, 1350 , 100);
+        ATOM_PWM_SetDuty(ATOMPWM0,2000, 12500);    //设定舵机的占空比
+    }
+    else
+    {
+        ATOM_PWM_SetDuty(ATOMPWM1,0, 12500);    //设定舵机的占空比
+        ATOM_PWM_SetDuty(ATOMSERVO2, fjc_duty, 100);
+        if(abs(fjc_duty - 1280) <=180)
+        {
+            speed += 40;
+        }
+        else
+        {
+            speed -=50;
+        }
+        speed = constrain_int(speed,2200,2800);  // 限幅
+        ATOM_PWM_SetDuty(ATOMPWM0,speed, 12500);    //电机
+    }
+    sprintf(txtq,"%.2f",fuzzy_txt1[0]);
+    sprintf(txtd,"%.2f",fuzzy_txt1[1]);
+ //   sprintf(txta,"res=%d",fuzzy_txt2[0]);
+//    sprintf(txtb,"duty=%.2f",fuzzy_txt1[2]);
+
+    //TFTSPI_P8X16Str(0, 6, txtq,u16WHITE,u16BLACK);
+    //TFTSPI_P8X16Str(0, 7, txtd,u16WHITE,u16BLACK);
+    //TFTSPI_P8X16Str(0, 8, txta,u16WHITE,u16BLACK);
+    //TFTSPI_P8X16Str(0, 9, txtb,u16WHITE,u16BLACK);
+//    UART_PutStr (UART0, txtq);
+//    UART_PutStr (UART0, " ");
+//    UART_PutStr (UART0, txtd);
+//    UART_PutStr (UART0, "\r\n");
+//    UART_PutStr (UART0, txta);
+//    UART_PutStr (UART0, "\r\n");
+   // UART_PutStr (UART0, txtb);
+   // UART_PutStr (UART0, "\n");
+}
+
+/*************************************************************************
+*  函数名称：float KalmanFilter_Elect(float curr_elect_val,float last_elect_val)
+*  功能说明：卡尔曼滤波
+*  参数说明：无
+*  函数返回：无
+*  修改时间：2021年5月9日
+*  备    注：无
+*************************************************************************/
+float KalmanFilter_Elect(float curr_elect_val,float last_elect_val)
+{
+  static float Q_curr = 0.1;//1.0           //Q增大，动态响应增大，过程噪声的协方差
+  static float Q_last = 0.0001;         //过程噪声的协方差，过程噪声的协方差为一个一行两列矩阵
+  static float R_elect = 10.0;                  //测量噪声的协方差 即测量偏差
+  static float dt = 0.006;   //0.0055                    //积分间隔
+
+  static float Pk[2][2] = { {1, 0}, {0, 1 }};
+
+  static float Pdot[4] = {0,0,0,0};
+
+  static float q_bias = 0.0;
+  static float elect_err = 0.0;
+  static float PCt_0 = 0.0;
+  static float PCt_1 = 0.0;
+  static float E = 0.0;
+  static float K_0 = 0.0, K_1 = 0.0, t_0 = 0.0, t_1 = 0.0;
+
+  Pdot[0] = Q_curr - Pk[0][1] - Pk[1][0];       //Pk-先验估计误差协方差的微分
+  Pdot[1] = -Pk[1][1];
+  Pdot[2] = -Pk[1][1];
+  Pdot[3] = Q_last;
+
+  Pk[0][0] += Pdot[0] * dt;             //Pk-先验估计误差的协方差微分的积分
+  Pk[0][1] += Pdot[1] * dt;             //先验估计误差协方差
+  Pk[1][0] += Pdot[2] * dt;
+  Pk[1][1] += Pdot[3] * dt;
+
+  elect_err = curr_elect_val - last_elect_val;          //偏差 = 测量值 - 预测值，先验估计
+
+  PCt_0 = Pk[0][0];
+  PCt_1 = Pk[1][0];
+
+  E = R_elect + PCt_0;
+
+  K_0 = PCt_0 / E;
+  K_1 = PCt_1 / E;
+
+  t_0 = PCt_0;
+  t_1 = Pk[0][1];
+
+  Pk[0][0] -= K_0 * t_0;                    //后验估计误差协方差
+  Pk[0][1] -= K_0 * t_1;
+  Pk[1][0] -= K_1 * t_0;
+  Pk[1][1] -= K_1 * t_1;
+
+  curr_elect_val += K_0 * elect_err;                //后验估计 更新最优电磁值 最优电磁值 = 预测值 + 卡尔曼增益*(测量值-预测值)
+  q_bias += K_1 * elect_err;                //后验估计 更新误差
+
+  return curr_elect_val;
+
+}
+
+
+/*************************************************************************
+*  函数名称：void Datadeal()
+*  功能说明：数据处理函数
+*  参数说明：无
+*  函数返回：无
+*  修改时间：2021年5月10日
+*  备    注：无
+*************************************************************************/
+void Datadeal()
+{
+    char txtb[15] = {0};
+    char txta[15] = {0};
+    last_val = curr_val;
+    up_last_val = up_curr_val;
+    elect_M = (ad_VAL[2]+ad_VAL[3])/2.0;
+      //水平电感差比和
+    curr_val =  (my_sqrt(ad_VAL[4]) - my_sqrt(ad_VAL[1] ))/ (my_sqrt(ad_VAL[4]) + my_sqrt(ad_VAL[1])+ my_sqrt(elect_M));
+    //竖直电感差比和
+    up_curr_val =(my_sqrt(ad_VAL[5] ) - my_sqrt(ad_VAL[0])) / (my_sqrt(ad_VAL[5]) + my_sqrt(ad_VAL[0]) + my_sqrt(elect_M));
+
+    curr_val = KalmanFilter_Elect(curr_val,last_val);                 //卡尔曼滤波
+    up_curr_val = KalmanFilter_Elect(up_curr_val,up_last_val);
+
+    delta_val = curr_val - last_val;                                            //电磁变化率
+    up_delta_val = up_curr_val - up_last_val;
+
+
+    if(fabs(curr_val) <= fabs(up_curr_val))
+    {//两边电感差比和大，则忽略中间电感值
+      curr_val = up_curr_val;
+      if(curr_val<0)
+          curr_val *= 1.5;
+
+      delta_val = up_delta_val;
+      if(delta_val > 0)
+          delta_val /=3;
+    }
+
+
+
+
+}
+
+/*************************************************************************
+*  函数名称：void DirJudge()
+*  功能说明：判断舵机偏转方向函数
+*  函数返回：res：弯道判断结果
+*  修改时间：2021年4月3日
+*  备    注：特征弯道判断（一定要使用电机进行特征值采集，切勿使用手推！）
+*************************************************************************/
+void DirJudge()
+{
+    /*if(ad_VAL[0]+ad_VAL[5]>=180)
+    {
+        res = 0;
+    }*/
+    if(ad_VAL[5] >= 98 && res == 0 && ad_VAL[1] <= 15 && ad_VAL[2] + ad_VAL[3] <= 70 &&ad_VAL[0] < 40 )
+    {
+        res = 2;        //右转
+
+    }
+    if(ad_VAL[0] >= 95 && res == 0 && ad_VAL[1] <= 13 && ad_VAL[2] + ad_VAL[3] <= 70 && ad_VAL[6] < 30 )
+    {
+        res = 1;
+    }
+    if(ad_VAL[2] >= 100 && ad_VAL[3] >= 100 && ad_VAL[4] >= 100)
+    {
+        hd_in = 1;
+        res = 3;
+    }
+    if((ad_VAL[1] >= 100 && ad_VAL[2] >=100 && ad_VAL[3] >= 100) && hd_in ==1)
+    {
+        res = 4;
+    }
+
+}
+
+void Key_Control()
+{
+    if(!KEY_Read(KEY0))
+        s_pid.D = 0;
+    if(!KEY_Read(KEY1))
+        s_pid.P -= 0.03;
+    if(!KEY_Read(KEY2))
+        s_pid.P += 0.03;
+
+}

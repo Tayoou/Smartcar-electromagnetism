@@ -1,0 +1,9 @@
+AURIX-LIBRARY-PATH=Libraries/iLLD\#Libraries/Infra\#Libraries/Service
+DEVICE-ID=TC26B
+DEVICE-ID-FULL=TC26xDA_B-Step
+ILLD-SET=full
+LIBRARIES-ROOT-PATH=Libraries
+NEVER-EXCLUDE-FROM-BUILD=/Libraries/iLLD/TC26B/Tricore/Cpu/CStart\#/Libraries/iLLD/TC26B/Tricore/Cpu/Trap\#/Configurations\#/Configurations/Debug
+PROJECT-VERSION=1.0
+aurixDevice=TC26xDA_B-Step
+eclipse.preferences.version=1
